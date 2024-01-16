@@ -1,0 +1,1192 @@
+---
+title: "CITS4009 Computational Data Analysis"
+subtitle: "Project 2"
+author: "Angela JACINTO (23778435) (50%): all tasks, Benyapa INSAWANG (23890758) (50%): all tasks"
+output:
+  html_document: 
+    toc: true
+  html_notebook: default
+---
+#### Download libraries
+```{r, message = FALSE}
+library(dplyr)
+library(ggplot2)
+library(shiny)
+library(shinyWidgets)
+library(gridExtra)
+library(tidyverse)
+library(readxl)
+library(rpart)
+library(rpart.plot)
+library(ROSE)
+library(knitr)
+```
+
+## Part 1 - Classification
+For the purpose of classification, we want to classify `highest_yearly_earnings` of each Youtuber. We will find the information of GDP of each country and create the target variable `status` based on the GDP of that YouTuber's country.
+
+### Section 1 - Data Preparation
+```{r}
+df <- read.csv('youtube_UTF_8.csv', na.strings = c('nan'))
+df <- df[, -c(6, 9, 11:13, 15:17, 21:28)] # Remove redundant columns
+```
+`highest_yearly_earnings` has a high correlation to `lowest_monthly_earnings`, `highest_monthly_earnings`, and `lowest_yearly_earnings`, so we will remove them from this analysis. Some redundant columns such as `Title` and `Abbreviation` will be excluded. Lastly, we will remove the columns `created_month`, `created_date`, `Gross.tertiary.education.enrollment....`, `Population`, `Unemployment.rate`, `Urban_population`, `Latitude`, and `Longitude` because the last six columns are directly related to `Country`, so we should only keep `Country`.
+
+```{r}
+# Function to count NAs in each columns
+count_na_in_column <- function(data) {
+  sapply(data, FUN = function(col) sum(is.na(col)))}
+count_na_in_column(df)
+```
+There are 122 missing entries in the `Country` variable, and we need to impute these values since we rely on the GDP information based on the `Country`. Our chosen method for imputation is to use the mode of the `Country` variable to fill in the missing values.
+
+#### 1. Impute missing values in `Country`
+```{r}
+# Extract the name of the country
+country_name <- df$Country %>%
+  table() %>%
+  names()
+
+# Extract the name of the country with the maximum frequency
+country_mode <- country_name[which.max(table(df$Country))]
+
+# Impute missing country with mode
+df <- df %>%
+  mutate(Country = ifelse(is.na(Country), country_mode, Country)) 
+```
+
+#### 2. Impute missing values in `subscribers_for_last_30_days`, `video_views_for_the_last_30_days`
+```{r}
+replace_na_with_median <- function(data, columns) {
+  for (col in columns) {
+    x <- data[[col]]
+    non_na_values <- x[!is.na(x)]
+    median_value <- median(non_na_values)
+    is_bad <- ifelse(is.na(x), 1, 0) # isBAD take value 1 when NA is replaced by median
+    data[[col]][is.na(data[[col]])] <- median_value
+    data[[paste0(col, "_isBAD")]] <- is_bad
+  }
+  return(data)
+}
+
+columns_to_replace <- c("subscribers_for_last_30_days", "video_views_for_the_last_30_days")
+df <- replace_na_with_median(df, columns_to_replace)
+```
+
+#### 3. Impute missing values in `category` and `channel_type`
+```{r}
+replace_missing_with_mapping <- function(data, level_mapping) {
+  for (i in seq_len(nrow(level_mapping))) {
+    category_level <- level_mapping$category_level[i]
+    channel_level <- level_mapping$channel_level[i]
+    
+    data$channel_type[is.na(data$channel_type) & data$category == category_level] <- channel_level
+    data$category[is.na(data$category) & data$channel_type == channel_level] <- category_level
+  }
+  return(data)
+}
+
+# Create mapping of similar level of category and channel_type
+level_mapping <- data.frame(
+  category_level = c("Pets & Animals", "Autos & Vehicles", "Comedy", "Education", "Entertainment", "Film & Animation", "Gaming", "Howto & Style", "Music", "News & Politics", "Nonprofits & Activism", "People & Blogs", "Sports", "Science & Technology"),
+  channel_level = c("Animals", "Autos", "Comedy", "Education", "Entertainment", "Film", "Games", "Howto", "Music", "News", "Nonprofit", "People", "Sports", "Tech"))
+
+df <- replace_missing_with_mapping(df, level_mapping)
+```
+
+```{r}
+count_na_in_column(df)
+df <- na.omit(df)  # Omit the row with missing values
+```
+
+#### 4. GDP information for each `Country`
+```{r}
+gdp <- read_excel("GDP.xls", na = "no data")
+gdp <- as.data.frame(gdp) # Convert tibble to dataframe
+gdp <- gdp[-1, ] # Remove an empty first row
+new_column_names <- c("Country", as.character(1980:2028))
+gdp <- gdp %>%
+  rename_with(~new_column_names, .cols = everything()) # Rename columns
+```
+
+```{r}
+# Verify the consistency of country names between the YouTube data and GDP data
+country_name %in% gdp$Country %>%
+  sum() - length(country_name)
+country_name[which(!country_name %in% gdp$Country)]
+```
+We found that there are 5 countries in the YouTube dataset that are not in the GDP dataset. After checking the completeness of this dataset, we have to rename 4 countries. However, this dataset does not have the GDP of Cuba, so we need to find another data source.
+
+```{r}
+gdp <- gdp %>%
+  mutate(Country = gsub("China, People's Republic of", "China", Country)) %>%
+  mutate(Country = gsub("Korea, Republic of", "South Korea", Country)) %>%
+  mutate(Country = gsub("Russian Federation", "Russia", Country)) %>%
+  mutate(Country = gsub("Türkiye, Republic of", "Turkey", Country))
+gdp[gdp$Country %in% levels(as.factor(df$Country)), c("Country", "2020", "2021", "2022", "2023")]
+```
+46 countries have the latest (2023) GDP data, except for Pakistan and Afghanistan. Therefore, we will use the most recent available GDP figures, which are from 2022 for Pakistan and 2020 for Afghanistan.
+
+```{r}
+gdp2023 <- gdp[, c(1, 45)]
+gdp2022 <- subset(gdp, Country == "Pakistan", select = c("Country", "2022"))
+gdp2020 <- subset(gdp, Country == "Afghanistan", select = c("Country", "2020"))
+```
+We joined the GDP dataset to the YouTube dataset using `Country` as the key. We used a `left_join()` because there is still missing GDP data for Cuba.
+
+```{r}
+df_gdp <- left_join(df, gdp2023, by = "Country")
+df_gdp <- df_gdp %>%
+  rename(GDP = `2023`) # Rename GDP column
+df_gdp$GDP <- ifelse(df_gdp$Country == "Afghanistan", gdp2020[1, 2],
+                    ifelse(df_gdp$Country == "Pakistan", gdp2022[1, 2], df_gdp$GDP))
+```
+
+```{r, message = FALSE}
+worldbank <- read_excel("gdp_worldbank.xls")
+worldbank <- worldbank[-c(1:2), ] %>%
+  setNames(.[1, ]) # Make the first row as column names
+worldbank <- worldbank[-1, ] %>%
+  as.data.frame()
+```
+We used another data source for the GDP of Cuba, called "gdp_worldbank.xls". The latest available GDP for Cuba is from 2020. We have now completed the process of finding GDP for every country in the YouTube dataset.
+
+```{r}
+subset(worldbank, `Country Name` == "Cuba", select = c(`2020`, `2021`, `2022`))
+cuba_gdp <- subset(worldbank, `Country Name` == "Cuba", select = c(`Country Name`, `2020`))
+df_gdp$GDP <- ifelse(df_gdp$Country == "Cuba", cuba_gdp[1, 2], df_gdp$GDP)
+sum(is.na(df_gdp$GDP)) # All GDP is inserted
+rm(gdp2020, gdp2022, gdp2023, cuba_gdp, gdp, worldbank) # Remove unused dataframe
+```
+
+#### 5. Convert dataframe to the appropriate structure
+```{r}
+df_gdp <- df_gdp %>%
+  mutate(GDP = as.numeric(GDP)) %>%
+  mutate(created_year = as.factor(created_year)) %>%
+  mutate(subscribers_for_last_30_days_isBAD = as.factor(subscribers_for_last_30_days_isBAD)) %>%
+  mutate(video_views_for_the_last_30_days_isBAD = as.factor(video_views_for_the_last_30_days_isBAD))
+```
+
+#### 6. Create target variable `status`
+```{r}
+df_gdp$status <- ifelse(df_gdp$GDP < df_gdp$highest_yearly_earnings, 1, 0)
+table(df_gdp$status)
+```
+The target variable `status` is created with 1 indicating high income earning and 0 indicating low income earning. There are 817 high income-earning YouTubers against 169 low income-earning ones. This is not balanced; therefore, we will use the ROSE package for the generation of synthetic data by Randomly Oversampling Examples to balance the `status` variable.
+
+#### 7. Balancing traget variable `status`
+```{r}
+df_gdp.rose <- df_gdp[, -c(1:2, 8, 10, 15, 17)]
+
+# Convert the Country column to a be numeric column
+country_mapping <- c(
+  "Afghanistan" = 1, "Andorra" = 2, "Argentina" = 3, "Australia" = 4,
+  "Bangladesh" = 5, "Barbados" = 6, "Brazil" = 7, "Canada" = 8,
+  "Chile" = 9, "China" = 10, "Colombia" = 11, "Cuba" = 12,
+  "Ecuador" = 13, "Egypt" = 14, "El Salvador" = 15, "Finland" = 16,
+  "France" = 17, "Germany" = 18, "India" = 19, "Indonesia" = 20,
+  "Iraq" = 21, "Italy" = 22, "Japan" = 23, "Jordan" = 24,
+  "Kuwait" = 25, "Latvia" = 26, "Malaysia" = 27, "Mexico" = 28,
+  "Morocco" = 29, "Netherlands" = 30, "Pakistan" = 31, "Peru" = 32,
+  "Philippines" = 33, "Russia" = 34, "Samoa" = 35, "Saudi Arabia" = 36,
+  "Singapore" = 37, "South Korea" = 38, "Spain" = 39, "Sweden" = 40,
+  "Switzerland" = 41, "Thailand" = 42, "Turkey" = 43, "Ukraine" = 44,
+  "United Arab Emirates" = 45, "United Kingdom" = 46, "United States" = 47,
+  "Venezuela" = 48, "Vietnam" = 49)
+df_gdp.rose$Country <- country_mapping[df_gdp.rose$Country]
+df_gdp.rose$Country <- as.factor(df_gdp.rose$Country)
+
+# Convert the category column to a be numeric column
+category_mapping <- c(
+  "Autos & Vehicles" = 1, "Comedy" = 2, "Education" = 3, "Entertainment" = 4,
+  "Film & Animation" = 5, "Gaming" = 6, "Howto & Style" = 7, "Movies" = 8,
+  "Music" = 9, "News & Politics" = 10, "Nonprofits & Activism" = 11, "People & Blogs" = 12,
+  "Pets & Animals" = 13, "Science & Technology" = 14, "Shows" = 15, "Sports" = 16,
+  "Trailers" = 17, "Travel & Events" = 18)
+df_gdp.rose$category <- category_mapping[df_gdp.rose$category]
+df_gdp.rose$category <- as.factor(df_gdp.rose$category)
+
+df.rose <- ROSE(status ~ ., data = df_gdp.rose, seed=123)$data
+table(df.rose$status)
+df.rose$status <- as.factor(df.rose$status)
+```
+ROSE handles only continuous and categorical variables, so we converted `Country` and `category` into numeric ones. After applying ROSE, we achieved a balanced dataset.
+
+#### 8. Split Train/Test dataset
+```{r}
+# a 90/10 split to form the training and test sets
+set.seed(729375)
+df.rose$rgroup <- runif(dim(df.rose)[1])
+dTrainAll <- subset(df.rose, rgroup<=0.9)
+dTest <- subset(df.rose, rgroup>0.9)
+outcome <- c('status')
+pos <- '1'
+
+# names of columns that are categorical type and numerical type 
+vars <- colnames(df.rose)[!(colnames(df.rose) %in% c("status", "rgroup"))]
+catVars <- vars[sapply(dTrainAll[, vars], class) %in% c('factor', 'character')]
+numericVars <- vars[sapply(dTrainAll[, vars], class) %in% c('numeric', 'integer')] 
+
+# split dTrainAll into a training set and a validation (or calibration) set
+useForCal <- rbinom(n=dim(dTrainAll)[1], size=1, prob=0.1)>0 
+dCal <- subset(dTrainAll, useForCal)
+dTrain <- subset(dTrainAll, !useForCal)
+```
+
+```{r}
+cat("Country list in dTrain:")
+table(dTrain$Country)
+cat("Country list in dTest:")
+table(dTest$Country)
+dTest <- dTest %>% filter(Country != 27)
+```
+At country level 27 (Malaysia), the training data does not include that level, while the test data does. This mismatch could potentially cause issues during predictions on the test dataset. Therefore, we need to exclude that observation from the test data.
+
+### Section 2 - Single Variable Model
+```{r}
+# Function to calculate predictions for categorical variables
+mkPredC <- function(outCol, varCol, appCol) {
+  pPos <- sum(outCol == pos) / length(outCol)
+  naTab <- table(as.factor(outCol[is.na(varCol)]))
+  pPosWna <- (naTab/sum(naTab))[pos]
+  vTab <- table(as.factor(outCol), varCol)
+  pPosWv <- (vTab[pos, ] + 1.0e-3*pPos) / (colSums(vTab) + 1.0e-3)
+  pred <- pPosWv[appCol]
+  pred[is.na(appCol)] <- pPosWna
+  pred[is.na(pred)] <- pPos
+  pred
+}
+```
+
+```{r}
+for(v in catVars) {
+  pi <- paste('pred', v, sep='')
+  dTrain[,pi] <- mkPredC(dTrain[,outcome], dTrain[,v], dTrain[,v])
+  dCal[,pi] <- mkPredC(dTrain[,outcome], dTrain[,v], dCal[,v])
+  dTest[,pi] <- mkPredC(dTrain[,outcome], dTrain[,v], dTest[,v])
+}
+```
+
+```{r}
+# Function to evaluate prediction through AUC score
+library('ROCR')
+calcAUC <- function(predcol,outcol) {
+  perf <- performance(prediction(predcol,outcol==pos),'auc')
+  as.numeric(perf@y.values)
+}
+```
+
+```{r}
+for(v in catVars) {
+  pi <- paste('pred', v, sep='')
+  aucTrain <- calcAUC(dTrain[,pi], dTrain[,outcome])
+  if (aucTrain >= 0.5) {
+    aucCal <- calcAUC(dCal[,pi], dCal[,outcome])
+    print(sprintf("%s: trainAUC: %4.3f; calibrationAUC: %4.3f", pi, aucTrain, aucCal))
+    }
+}
+```
+The AUC results on the training and calibration dataset represent the ability of a model to distinguish between the positive and negative classes. An AUC of 0.5 indicates that the model has no discriminatory power and is equivalent to random guessing. All the categorical predictors have AUCs greater than 0.5, meaning all of them have some level of discriminatory power. The predictor with the best discriminatory power on the training data is `predCountry` with an AUC of 0.734. While the predictor `predsubscribers_for_last_30_days_isBAD` has the best performance on unseen data with an AUC of 0.709. 
+
+```{r}
+# 100 fold cross validation
+for (v in catVars) {
+  aucs <- rep(0,100)
+  for (rep in 1:length(aucs)) {
+    useForCalRep <- rbinom(n=nrow(dTrainAll), size=1, prob=0.1) > 0
+    predRep <- mkPredC(dTrainAll[!useForCalRep, outcome],
+                       dTrainAll[!useForCalRep, v],
+                       dTrainAll[useForCalRep, v])
+    aucs[rep] <- calcAUC(predRep, dTrainAll[useForCalRep, outcome])
+    }
+  print(sprintf("%s: mean: %4.3f; sd: %4.3f", v, mean(aucs), sd(aucs)))
+  }
+```
+In order to gain a more robust performance metric, we apply the 100 fold cross validation where the dataset is split multiple times so we can assess how the model would perform on various different portions of the data and  get a better understanding of how the model might perform on unseen data. From the results above, the predictor `Country` shows the strongest discriminatory power with a mean AUC of 0.70. Overall, all predictors performed consistently as evidenced by the relatively small standard deviations. 
+```{r}
+# Double density plot
+str(factor(dTrain[,"category"]))
+str(factor(dTrain[,"Country"]))
+str(factor(dTrain[,"created_year"]))
+fig1 <- ggplot(dCal) + geom_density(aes(x=predcategory, color=as.factor(status)))
+fig2 <- ggplot(dCal) + geom_density(aes(x=predCountry, color=as.factor(status)))
+fig3 <- ggplot(dCal) + geom_density(aes(x=predcreated_year, color=as.factor(status)))
+grid.arrange(fig1, fig2, fig3, ncol=2)
+```
+
+In order to visualize the distribution of the predicted values between the two classes, we created a density plot for each variable. 
+The sharp peak in the blue curve of the `predcreated_year vs. status` plot, signifies a dominant presence of high earners compared to low earners especially when its around the value of 0.5. In contrast, there is a significant amount of high earners and low earners in the `predcategory vs. status` and `predCountry vs. status` plot where the value is around 0.4-0.5 as evidenced by the sharp peaks at these points. However, these two predictors have a significant overlap which makes it more complex to differentiate between positive and negative classes. 
+
+```{r}
+# ROC Curve
+library(ROCit)
+plot_roc <- function(predcol, outcol, colour_id=2, overlaid=F) {
+  ROCit_obj <- rocit(score=predcol, class=outcol==pos)
+  par(new=overlaid)
+  plot(ROCit_obj, col = c(colour_id, 1),
+  legend = FALSE, YIndex = FALSE, values = FALSE)
+}
+```
+
+```{r}
+plot_roc(dTest$predcategory, dTest[,outcome]) # red
+plot_roc(dTest$predCountry, dTest[,outcome], colour_id=3, overlaid=T) # green
+plot_roc(dTest$predcreated_year, dTest[,outcome], colour_id=5, overlaid=T) # sky blue
+```
+
+The ROC plot above provides a visual analysis to examine the trade-off between the true positive rate and the false positive rate of the classifier. The `predcreated_year` model has little to no ability to discriminate between the positive and negative classes as it closely follows the dashed line, which represents no discriminatory power. On the other hand, the model being represented by the green curve `predCountry` has a good discriminative ability, particularly at thresholds where the curve is steepest. It is considerably better than random guessing due to its substantial departure from the diagonal line, which means that it has a lower false positive rate than a random classifier.
+
+```{r}
+# Function to calculate predictions for numerical variables
+mkPredN <- function(outCol, varCol, appCol) {
+  # compute the cuts
+  cuts <- unique(
+  quantile(varCol, probs=seq(0, 1, 0.1), na.rm=T))
+  # discretize the numerical columns
+  varC <- cut(varCol,cuts)
+  appC <- cut(appCol,cuts)
+  mkPredC(outCol,varC,appC)
+  }
+```
+
+```{r}
+for (v in numericVars) {
+  pi <- paste('pred', v, sep='')
+  dTrain[,pi] <- mkPredN(dTrain[,outcome], dTrain[,v], dTrain[,v])
+  dCal[,pi] <- mkPredN(dTrain[,outcome], dTrain[,v], dCal[,v])
+  dTest[,pi] <- mkPredN(dTrain[,outcome], dTrain[,v], dTest[,v])
+  aucTrain <- calcAUC(dTrain[,pi], dTrain[,outcome])
+  if(aucTrain >= 0.55) {
+    aucCal <- calcAUC(dCal[,pi], dCal[,outcome])
+    print(sprintf("%s: trainAUC: %4.3f; calibrationAUC: %4.3f", pi, aucTrain, aucCal))
+  }
+  }
+```
+All the numerical predictors have AUCs greater than 0.5, meaning all of them have some level of discriminatory power. The predictor with the strongest discriminatory power in the training data is `preduploads` with an AUC of 0.843. Notably, its performance on unseen data stands out with an AUC of 0.815. Overall, this predictor consistently demonstrate robust capabilities.
+```{r}
+for (v in numericVars) {
+aucs <- rep(0,100)
+for (rep in 1:length(aucs)) {
+useForCalRep <- rbinom(n=nrow(dTrainAll), size=1, prob=0.1) > 0
+predRep <- mkPredN(dTrainAll[!useForCalRep, outcome],
+dTrainAll[!useForCalRep, v],
+dTrainAll[useForCalRep, v])
+aucs[rep] <- calcAUC(predRep, dTrainAll[useForCalRep, outcome])
+}
+print(sprintf("%s: mean: %4.3f; sd: %4.3f", v, mean(aucs), sd(aucs)))
+}
+```
+After conducting a 100-fold cross-validation on the numerical predictors, `uploads` demonstrates the strongest ability to differentiate between classes, with a mean of 0.831 and a very small standard deviation of 0.044 while all predictors show reasonable performance consistency across the 100 cross-validation folds. 
+
+```{r}
+fig1 <- ggplot(dCal) + geom_density(aes(x=predsubscribers, color=as.factor(status)))
+fig2 <- ggplot(dCal) + geom_density(aes(x=predvideo.views, color=as.factor(status)))
+fig3 <- ggplot(dCal) + geom_density(aes(x=preduploads, color=as.factor(status)))
+fig4 <- ggplot(dCal) + geom_density(aes(x=predvideo_views_for_the_last_30_days, color=as.factor(status)))
+fig5 <- ggplot(dCal) + geom_density(aes(x=predsubscribers_for_last_30_days, color=as.factor(status)))
+
+grid.arrange(fig1, fig2, fig3, fig4, fig5, ncol=2)
+```
+
+The plots for `predsubscribers` and `predvideo.views` exhibit overlapping curves, which highlights the complexity in differentiating between high and low earning channels based solely on these individual variables. This overlap demonstrates the importance of considering additional variables or features for a more accurate classification. In contrast, the `preduploads` graph distinctly underscores its efficacy in discerning between the two classes. With its blue curve peaking around the 0.8 mark, it suggests that channels with high predicted upload counts often correlate with high earnings. Shifting the focus to the `predvideo_views_for_the_last_30_days` plot, a  peak in the blue curve around the 0.6 mark demonstrates a clear association between channels that have gained a number of predicted video views in the last 30 days and higher earnings. Furthermore, the `predsubscribers_for_last_30_days` graph illustrates the trend where channels with a notable increase in subscribers, evidenced by the peak around the 0.8 mark, suggests high earnings.
+
+```{r}
+calcAUC(dTrain[,"predsubscribers"], dTrain[,outcome]); calcAUC(dCal[,"predvideo.views"], dCal[,outcome]); calcAUC(dCal[,"preduploads"], dCal[,outcome]); calcAUC(dCal[,"predvideo_views_for_the_last_30_days"], dCal[,outcome]); calcAUC(dCal[,"predsubscribers_for_last_30_days"], dCal[,outcome])
+
+plot_roc(dTest$predsubscribers, dTest[,outcome]) #red
+plot_roc(dTest$predvideo.views, dTest[,outcome], colour_id=3, overlaid=T) #green
+plot_roc(dTest$preduploads, dTest[,outcome], colour_id=4, overlaid=T) #blue
+plot_roc(dTest$predvideo_views_for_the_last_30_days, dTest[,outcome], colour_id=5, overlaid=T) #skyblue
+plot_roc(dTest$predsubscribers_for_last_30_days, dTest[,outcome], colour_id=6, overlaid=T) #purple
+
+df.roc <- dTest
+```
+Based on the insights derived from the ROC plot for the numerical variables, it's evident that each variable possesses a distinct discriminatory capability. The predictor `predvideo.views`, symbolized by the green curve, exhibits moments where it follows the dashed line if not slightly below it. In contrast, both `preduploads` and `predsubscribers_for_last_30_days` are standout predictors. Their curves, prominently lean towards the left side of the plot, which signifies a performance that is exceptionally better than random guessing. This pronounced deviation from the dashed line highlights the heightened true positive rate of these two predictors compared to a random classifier.
+
+### Section 3 - Feature Selection
+We employed two techniques for feature selection: the Boruta package and the Fisher score. As the Fisher score requires numeric features, we converted all features to numeric format and applied both techniques to ensure consistency.
+```{r}
+df.rose <- df.rose %>%
+  mutate(subscribers_for_last_30_days_isBAD  = as.numeric(subscribers_for_last_30_days_isBAD)) %>%
+  mutate(video_views_for_the_last_30_days_isBAD  = as.numeric(video_views_for_the_last_30_days_isBAD)) %>%
+  mutate(created_year  = as.numeric(created_year)) %>%
+  mutate(Country  = as.numeric(Country)) %>%
+  mutate(category  = as.numeric(category))
+```
+
+To ensure that the training, calibration, and test sets remain consistent with the conversion of features to numeric format, we regenerated the split from the updated data.
+```{r}
+# a 90/10 split to form the training and test sets.
+set.seed(729375)
+df.rose$rgroup <- runif(dim(df.rose)[1])
+dTrainAll <- subset(df.rose, rgroup<=0.9)
+dTest <- subset(df.rose, rgroup>0.9)
+outcome <- c('status')
+pos <- "1"
+
+# names of columns that are categorical type and numerical type
+vars <- colnames(df.rose)[!(colnames(df.rose) %in% c("status", "rgroup"))]
+catVars <- vars[sapply(dTrainAll[, vars], class) %in% c('factor', 'character')]
+numericVars <- vars[sapply(dTrainAll[, vars], class) %in% c('numeric', 'integer')]
+
+# split dTrainAll into a training set and a validation (or calibration) set
+useForCal <- rbinom(n=dim(dTrainAll)[1], size=1, prob=0.1)>0
+dCal <- subset(dTrainAll, useForCal)
+dTrain <- subset(dTrainAll, !useForCal)
+```
+
+#### 1. Boruta
+```{r}
+library(Boruta)
+selected_features <- df.rose[, c("status", vars), drop = FALSE]
+boruta_result <- Boruta(status ~ ., data = selected_features, doTrace = 0)
+roughFixMod <- TentativeRoughFix(boruta_result)
+boruta_signif <- getSelectedAttributes(roughFixMod)
+attStats(boruta_result)
+```
+All the features listed in the table have been marked as "Confirmed", which indicates that all of the predictors are significant for predicting the `status` outcome.
+
+```{r}
+plot(boruta_result, cex.axis=.7, las = 2, xlab = "", main = "Variable Importance")
+```
+
+We decided to use the top seven predictors generated by the Boruta technique for the first combination of attributes, excluding the predictors `category`, `video.views`, and `subscribers`. 
+
+#### 2. Fisher Score
+```{r}
+# Fisher score
+numericVars <- vars[sapply(df.rose[, vars], class) %in% c('numeric', 'integer')]
+selected_numfeatures <- df.rose[, numericVars, drop = FALSE]
+target_variable <- as.factor(df.rose$status)
+
+# Function to calculate Fisher's Score for a single feature
+fisher_score <- function(feature, target) {
+  means <- tapply(feature, target, mean)
+  variances <- tapply(feature, target, var)
+  between_class_variance <- sum(table(target) * (means - mean(feature))^2) / (length(target) - 1)
+  within_class_variance <- sum((table(target) - 1) * variances) / (length(target) - length(unique(target)))
+  fisher_score <- between_class_variance / within_class_variance
+  return(fisher_score)
+}
+
+# Calculate Fisher's Scores for all features
+fisher_scores <- sapply(selected_numfeatures, function(feature) fisher_score(feature, target_variable))
+kable(fisher_scores)
+```
+The Fisher scores provide a measure of how well each numerical feature can discriminate between high earners and low earners. The predictors `video_views_for_the_last_30_days_isBAD`, `subscribers_for_last_30_days_isBAD`, and `subscribers_for_last_30_days` are some of the features with relatively higher discriminatory power, among all other predictors. 
+
+```{r}
+fisher_data <- data.frame(Feature = colnames(selected_numfeatures), Score = fisher_scores)
+ggplot(fisher_data, aes(x = Feature, y = Score)) +
+  geom_bar(stat = "identity", fill = "gray") +
+  labs(title = "Fisher's Scores", x = "Features", y = "Scores") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+We have opted to retain the same features as in the initial attribute combination, excluding `created_year` and substituting it with `video.views`.
+
+### Section 4 - Decision Tree
+Based on the results of the feature selection process, we have two sets of attributes as follows. We will use decision trees on these two sets.
+```{r}
+boruta.vars <- colnames(df.rose)[(colnames(df.rose) %in% c("video_views_for_the_last_30_days_isBAD", "video_views_for_the_last_30_days", "subscribers_for_last_30_days", "subscribers_for_last_30_days_isBAD", "uploads", "Country", "created_year"))]
+# boruta.vars <- colnames(df.rose)[(colnames(df.rose) %in% c("subscribers_for_last_30_days", "uploads"))]
+boruta.formula <- paste('as.factor(status) ~ ',
+            paste(c(boruta.vars), collapse=' + '),
+            sep='')
+dt.boruta <- rpart(formula = boruta.formula, data = dTrain)
+
+fisher.vars <- colnames(df.rose)[(colnames(df.rose) %in% c("video_views_for_the_last_30_days_isBAD", "subscribers_for_last_30_days_isBAD", "video_views_for_the_last_30_days", "subscribers_for_last_30_days", "uploads", "Country", "video.views"))]
+fisher.formula <- paste('as.factor(status) ~ ',
+            paste(c(fisher.vars), collapse=' + '),
+            sep='')
+dt.fisher <- rpart(formula = fisher.formula, data = dTrain)
+```
+
+```{r}
+rpart.plot(dt.boruta)
+rpart.plot(dt.fisher)
+```
+
+We can observe that the decision tree plots are identical for these two sets of attributes. However, the variable importance differs between the two sets. In the Boruta feature set, the important variables are `uploads`, `subscribers_for_last_30_days`, and `video_views_for_the_last_30_days`, with importance values of 53, 43, and 4, respectively.
+On the other hand, in the Fisher feature set, the important variables are `uploads`, `subscribers_for_last_30_days`, `video_views_for_the_last_30_days`, and `video.views`, with importance values of 52, 42, 4, and 2, respectively.
+```{r}
+predicted_train <- predict(dt.boruta, newdata=dTrain[boruta.vars], type = "class")
+predicted_test <- predict(dt.boruta, newdata=dTest[boruta.vars], type = "class")
+predicted_cal <- predict(dt.boruta, newdata=dCal[boruta.vars], type = "class")
+
+calculate_accuracy <- function(T1) {
+  diagonal_sum <- sum(diag(T1))
+  total_sum <- sum(T1)
+  accuracy <- diagonal_sum/total_sum
+  return(accuracy)
+}
+
+table(dTrain$status, predicted_train)
+table(dTest$status, predicted_test)
+table(dCal$status, predicted_cal)
+
+calculate_accuracy(table(dTrain$status, predicted_train))
+calculate_accuracy(table(dTest$status, predicted_test))
+calculate_accuracy(table(dCal$status, predicted_cal))
+```
+
+```{r}
+predicted_train <- predict(dt.fisher, newdata=dTrain[fisher.vars], type = "class")
+predicted_test <- predict(dt.fisher, newdata=dTest[fisher.vars], type = "class")
+predicted_cal <- predict(dt.fisher, newdata=dCal[fisher.vars], type = "class")
+
+calculate_accuracy <- function(T1) {
+  diagonal_sum <- sum(diag(T1))
+  total_sum <- sum(T1)
+  accuracy <- diagonal_sum / total_sum
+  return(accuracy)
+}
+
+table(dTrain$status, predicted_train)
+table(dTest$status, predicted_test)
+table(dCal$status, predicted_cal)
+
+calculate_accuracy(table(dTrain$status, predicted_train))
+calculate_accuracy(table(dTest$status, predicted_test))
+calculate_accuracy(table(dCal$status, predicted_cal))
+```
+As anticipated, the confusion matrix and accuracy are consistent for these two sets of attributes. The model achieves an accuracy of approximately 93%, which is notably high.
+
+### Section 5 - Logistic Regression
+#### 1. Logistic Regression 
+```{r}
+# Boruta-selected model 
+response <- outcome
+features <- boruta.vars
+formula.boruta <- as.formula(paste(response, paste(features, collapse=" + "), sep=" ~ "))
+model.boruta <- glm(formula.boruta, data=dTrain, family=binomial(link="logit"))
+summary(model.boruta)
+
+dTrain$logpred1 <- predict(model.boruta, newdata=dTrain, type="response")
+dTest$logpred1 <- predict(model.boruta, newdata=dTest, type="response")
+```
+
+```{r}
+# Fisher's Score-selected model 
+response <- outcome
+features <- fisher.vars
+formula.fisher <- as.formula(paste(response, paste(features, collapse=" + "), sep=" ~ "))
+model.fisher <- glm(formula.fisher, data=dTrain, family="binomial")
+summary(model.fisher)
+
+dTrain$logpred2 <- predict(model.fisher, newdata=dTrain, type="response")
+dTest$logpred2 <- predict(model.fisher, newdata=dTest, type="response")
+```
+Based on the summary of both logistic regression models, it is evident that they share similar coefficients and significance levels for the common predictor variables. Two predictors, `uploads` and `subscribers_for_last_30_days`, show a positive association with a higher likelihood of being in the positive class while `subscribers_for_last_30_days_isBAD` is strongly associated with the negative class, signifying its strong predictive power for this class. On the other hand, the predictor `Country` is statistically significant and its negative coefficient suggests that there are specific countries that have a higher likelihood of belonging to the positive class than others. Furthermore, both the Boruta-selected model and the Fisher's Score-selected model exhibit minimal differences in residual deviance and AIC scores. This similarity in performance metrics suggests that both models have a comparable level of complexity and are performing similarly well in predicting the outcome.
+
+
+#### 1. Logistic Regression Performance Evaluation
+In this section, we define and describe several functions used for performance evaluation of logistic regression models. These functions help us assess the accuracy, precision, recall, F1 score, and AUC of our models to evaluate the effectiveness of logistic regression models in predicting binary outcomes.
+```{r}
+# Function to compute accuracy, precision, recall, and F1 score
+performanceMeasures <- function(pred, truth, name = "model") {
+   ctable <- table(truth = truth, pred = (pred > 0.5))
+   accuracy <- sum(diag(ctable)) / sum(ctable)
+   precision <- ctable[2, 2] / sum(ctable[, 2])
+   recall <- ctable[2, 2] / sum(ctable[2, ])
+   f1 <- 2 * precision * recall / (precision + recall)
+   data.frame(model = name, precision = precision,
+              recall = recall,
+              f1 = f1, accuracy = accuracy)
+}
+```
+
+```{r}
+# Function to generate a well-formatted table comparing model performance on training and test datasets
+pretty_perf_table <- function(model,training,test) {
+  library(pander)
+  # setting up Pander Options
+  panderOptions("plain.ascii", TRUE)
+  panderOptions("keep.trailing.zeros", TRUE)
+  panderOptions("table.style", "simple")
+  perf_justify <- "lrrrr"
+
+  # comparing performance on training vs. test
+  pred_train <- predict(model, newdata=dTrain)
+  truth_train <- dTrain[, "status"]
+  pred_test <- predict(model, newdata=dTest)
+  truth_test <- dTest[, "status"]
+
+  trainperf_tree <- performanceMeasures(
+      pred_train, truth_train, "logistic, training")
+
+  testperf_tree <- performanceMeasures(
+      pred_test, truth_test, "logistic, test")
+
+  perftable <- rbind(trainperf_tree, testperf_tree)
+  pandoc.table(perftable, justify = perf_justify)
+}
+```
+
+```{r}
+# Function to calculate and display a confusion matrix to visualize the model's classification results
+confusion_matrix <- function(ytrue, ypred) {
+  ctable <- table(truth = ytrue, prediction = (ypred > 0.5))
+  print(ctable)
+}
+```
+
+```{r}
+#Function to compute AUC
+calculate_auc <- function(model, data, outcome_colname) {
+  predictions <- predict(model, newdata=data, type="response")
+  pred <- prediction(predictions, data[[outcome_colname]])
+  perf <- performance(pred, "auc")
+  auc <- as.numeric(perf@y.values[[1]])
+  return(auc)
+}
+```
+
+```{r}
+pretty_perf_table(model.boruta, dTrain, dTest)
+pretty_perf_table(model.fisher, dTrain, dTest)
+```
+While both the Boruta-selected and Fisher's Score-selected models showcase moderate performance, they demonstrate minimal disparities in the performance evaluation metrics. Both models illustrates good performance with each containing an accuracy of approximately 70% on the test set, underscoring their ability to accurately classify unseen data. Despite the marginal differences, the model employing features from the Boruta selection has a slightly higher accuracy rate,  at 73% on the test set. Moreover, the precision scores for both models are notably high, suggesting a high accuracy when predicting the positive class, resulting in only a few false positives. In terms of recall, both models show moderate performance, correctly identifying a significant portion data that belongs to a certain class, as shown in the recall values of 0.62 and 0.60 on the test sets. Furthermore, the F1-Scores at around 0.66 to 0.68, indicates a harmonic mean of precision and recall. 
+
+```{r}
+confusion_matrix(dTest$status, dTest$logpred1 > 0.5)
+confusion_matrix(dTest$status, dTest$logpred2 > 0.5)
+```
+The confusion matrices above, tell us that both models have a similar number of True Positives, True Negatives, False Positives, and False Negatives. This implies that the models correctly classify a similar number of positive and negative instances, indicating that they have a balanced classification capability.The number of False Positives is relatively low, which aligns with the high precision scores mentioned earlier. 
+
+```{r}
+auc_train <- calculate_auc(model.boruta, dTrain, "status")
+auc_test <- calculate_auc(model.boruta, dTest, "status")
+print(paste("AUC for training data: ", round(auc_train, 4), "; AUC for test data: ", round(auc_test, 4)))
+
+auc_train <- calculate_auc(model.fisher, dTrain, "status")
+auc_test <- calculate_auc(model.fisher, dTest, "status")
+print(paste("AUC for training data: ", round(auc_train, 4), "; AUC for test data: ", round(auc_test, 4)))
+```
+The AUC score of the test data for both models is slightly lower than the AUC score of the training data, which is an indication that the model may be slightly overfitting the training data. However, the difference is not substantial, indicating that the model's performance remains reasonably consistent when applied to unseen data. Notably, both the training and test AUC scores are well above the threshold of 0.5, indicating that the model has discriminatory power and can effectively distinguish between the positive and negative classes.
+
+
+### Section 6 - XGBoost Model and LIME
+In this section, we will explore the capabilities of XGBoost, a gradient boosting algorithm, and LIME, a powerful tool for model interpretation to provide concise explanations and practical use cases.
+```{r, message = F}
+library(xgboost)
+# Input:
+# - variable_matrix: matrix of input data
+# - labelvec: numeric vector of class labels (1 is positive class)
+# Returns:
+# - xgboost modelR
+xgb = function(variable_matrix, labelvec) {
+  cv <- xgb.cv(variable_matrix, label = labelvec,
+               params=list(
+                 objective="binary:logistic"
+               ),
+               nfold=5,
+               nrounds=100,
+               print_every_n=10,
+               metrics="logloss")
+
+  evalframe <- as.data.frame(cv$evaluation_log)
+  NROUNDS <- which.min(evalframe$test_logloss_mean)
+
+  model <- xgboost(data=variable_matrix, label=labelvec,
+                   params=list(
+                     objective="binary:logistic"
+                   ),
+                   nrounds=NROUNDS,
+                   verbose=FALSE)
+
+  model
+}
+```
+The xgb function trains an XGBoost model for binary classification and perform cross-validation to optimize its hyperparameters. The purpose of this technique is to find the best combination of hyperparameters for a machine learning model.
+The model undergoes 100 rounds of boosting and during each round, the model corrects its previous errors and updates its predictions based on the knowledge accumulated from previous rounds. As a result, the log loss values for both the training and test data decrease progressively with each boosting round.
+
+```{r}
+dTrain$status <- as.numeric(as.character(dTrain$status)) # xgboost requires numeric labels 
+input <- as.matrix(dTrain[boruta.vars])
+model <- xgb(input, dTrain$status)
+```
+The model achieves a log loss of approximately 0.30 to 0.36 on the test data, demonstrating its ability to make accurate predictions. This indicates that the model effectively learns from the data and enhances its predictive performance. 
+
+#### Lime Interpretation
+The following code uses the lime function to build an explainer, which takes the feature columns of the training dataset, the model, and puts the continuous variables into 10 bins when making explanations.
+```{r}
+library(lime)
+explainer <- lime(dTrain[boruta.vars], model = model, 
+                  bin_continuous = TRUE, n_bins = 10)
+```
+
+```{r fig.height=3, fig.width=2}
+cases <- c(3,11,24,49)
+(example <- dTest[cases,boruta.vars])
+explanation <- lime::explain(example, explainer, n_labels = 1, n_features = 7)
+ggsave("plot1.png", plot = plot_features(explanation), width = 12, height = 6)
+```
+
+![Plot](plot1.png)
+From the results of these random cases, the LIME plot illustrates an understanding of how different features influence the model's decision, highlighting that not all intuitively positive metrics such as high views or subscribers, support high earning possibilities. If we look at case 30, it is classified as a high earner with 85% probability with support predictors  `uploads` and `video_views_for_the_last_30_days_is_BAD` for the high earner classification. While its contradicting features suggests that a significant number of video views, new subscribers, country (in this case United States), and channel's age the high earner status. 
+Overall, we can see from the plot that `uploads` is the determining feature for the classification of these four instances. The rest of the features are less significant.
+
+```{r}
+input <- as.matrix(dTrain[fisher.vars])
+model <- xgb(input, dTrain$status)
+```
+The model achieves a log loss of approximately 0.31 to 0.39 on the test data, slightly higher than that of the log loss from the xgboost model that used the features generated by Boruta. While it is slightly higher, the range of log-loss is still relatively low, which indicates that it is still making reasonably accurate probabilistic predictions.  
+
+```{r}
+explainer <- lime(dTrain[fisher.vars], model = model, 
+                  bin_continuous = TRUE, n_bins = 10)
+```
+
+```{r}
+cases <- c(3,11,24,49)
+(example <- dTest[cases,fisher.vars])
+explanation <- lime::explain(example, explainer, n_labels = 1, n_features = 7)
+ggsave("plot2.png", plot = plot_features(explanation), width = 12, height = 6)
+```
+
+![Plot](plot2.png)
+Similar to the LIME plot generated from the feature combination 1 identified by Boruta, the feature set derived from Fisher's Score also produced comparable results. 
+
+### Conclusion
+Classification is a supervised learning technique used to categorize data points into predefined labels based on their features. Its purpose is to predict the predefined target label of a data point based on its characteristics, utilizing labeled training data to understand the relationships between different categories.
+
+Our exploration into the classification of the given dataset provided significant insights. Starting from analyzing single variable models, it was evident that the features `uploads` and `subscribers for the last 30 days` stood out in performance as evidenced by their AUC scores and the ROC plot analysis. This observation was reinforced when we delved into multivariable classification models. 
+
+When we integrated the feature combinations generated by Boruta and Fisher's score into different models, the results were highly similar. Specifically, in the logistic regression models, the 1% variance in accuracy and similar AUC scores between the two feature combinations suggests the consistent predictive power of the shared variables in both combinations. Meanwhile, the XGBoost model presented marginally better performance in the Boruta feature set over the Fisher's set, but the differences are not large enough to definitively favor one over the other. The minimal discrepancy between the results might be due to the fact that the two combinations only differed by a single variable.
+
+However, it is the Decision Tree model that offered a notable revelation. While both feature combinations produced almost identical trees, the standout finding was that just two features, `uploads` and `subscribers for the last 30 days`, were enough to yield an accuracy rate of 92%. This suggests that the other predictors might not be as influential.
+
+Given the above findings, it becomes evident that the Decision Tree model, specifically when reduced to the two aforementioned significant predictors, emerges as the most efficient choice for classification in this scenario. The ability of the Decision Tree to achieve these results with fewer predictors highlights its efficiency and potential for scalability in future applications.
+
+## Part 2 - Clustering
+We aim to cluster YouTubers based on their content creation habits, user engagement, and viewership statistics. We do not need a target variable for clustering. Our dataset consists of both numeric and categorical features, which we will convert into numeric values. Since these features have different scales, we will standardize them before using Euclidean Distance as the similarity measure for our clustering analysis.
+
+### Section 1 - Data Preparation
+As part of the pre-processing step, we will clean and prepare the YouTuber names, as we intend to use them for visualizing the results of the clustering analysis.
+```{r, results = F}
+df_gdp[grepl("^ý.*ý$", df_gdp$Youtuber), ]
+```
+There are 18 invalid Youtuber names (only contain "ý" symbol). To ensure the integrity of our data and meaningful analysis, we will exclude these invalid names from the dataset. Some Youtuber names still contain the "ý" and "ï¿½" symbol. To improve readability, we will replace these symbols with blanks.
+```{r}
+df_gdp <- df_gdp %>%
+  filter(!grepl("^ý.*ý$", Youtuber)) %>%
+  mutate(Youtuber = gsub("ý", "", Youtuber)) %>%
+  mutate(Youtuber = gsub("ï¿½", "", Youtuber))
+```
+
+```{r}
+# Convert the Country column to a be numeric column
+country_mapping <- c(
+  "Afghanistan" = 1, "Andorra" = 2, "Argentina" = 3, "Australia" = 4,
+  "Bangladesh" = 5, "Barbados" = 6, "Brazil" = 7, "Canada" = 8,
+  "Chile" = 9, "China" = 10, "Colombia" = 11, "Cuba" = 12,
+  "Ecuador" = 13, "Egypt" = 14, "El Salvador" = 15, "Finland" = 16,
+  "France" = 17, "Germany" = 18, "India" = 19, "Indonesia" = 20,
+  "Iraq" = 21, "Italy" = 22, "Japan" = 23, "Jordan" = 24,
+  "Kuwait" = 25, "Latvia" = 26, "Malaysia" = 27, "Mexico" = 28,
+  "Morocco" = 29, "Netherlands" = 30, "Pakistan" = 31, "Peru" = 32,
+  "Philippines" = 33, "Russia" = 34, "Samoa" = 35, "Saudi Arabia" = 36,
+  "Singapore" = 37, "South Korea" = 38, "Spain" = 39, "Sweden" = 40,
+  "Switzerland" = 41, "Thailand" = 42, "Turkey" = 43, "Ukraine" = 44,
+  "United Arab Emirates" = 45, "United Kingdom" = 46, "United States" = 47,
+  "Venezuela" = 48, "Vietnam" = 49)
+df_gdp$Country <- country_mapping[df_gdp$Country]
+
+# Convert the category column to a be numeric column
+category_mapping <- c(
+  "Autos & Vehicles" = 1, "Comedy" = 2, "Education" = 3, "Entertainment" = 4,
+  "Film & Animation" = 5, "Gaming" = 6, "Howto & Style" = 7, "Movies" = 8,
+  "Music" = 9, "News & Politics" = 10, "Nonprofits & Activism" = 11, "People & Blogs" = 12,
+  "Pets & Animals" = 13, "Science & Technology" = 14, "Shows" = 15, "Sports" = 16,
+  "Trailers" = 17, "Travel & Events" = 18)
+df_gdp$category <- category_mapping[df_gdp$category]
+
+df_gdp <- df_gdp %>%
+  mutate(created_year = as.numeric(created_year)) %>%
+  mutate(subscribers_for_last_30_days_isBAD = as.numeric(subscribers_for_last_30_days_isBAD)) %>%
+  mutate(video_views_for_the_last_30_days_isBAD = as.numeric(video_views_for_the_last_30_days_isBAD))
+```
+
+```{r}
+df.clust <- df_gdp[, -c(1:2, 8, 15:16)] %>% # Exclude irreverent columns
+  scale() %>% # Scale data
+  as.data.frame()
+```
+
+### Section 2 - Hierarchical Clustering
+We will compare the behavior of complete, ward.D2, and single linkage methods to cluster YouTubers into clusters.
+```{r}
+set.seed(123)
+random_data <- df.clust[sample(nrow(df.clust), 100), ]
+d.r <- dist(random_data, method = "euclidean")
+pfit.c.r <- hclust(d.r, method = "complete")
+pfit.w.r <- hclust(d.r, method = "ward.D2")
+pfit.s.r <- hclust(d.r, method = "single")
+
+plot(pfit.c.r, main="Cluster Dendrogram for Complete Linkage", cex = 0.6) 
+rect.hclust(pfit.c.r, k=3)
+
+plot(pfit.w.r, main="Cluster Dendrogram for Ward Linkage", cex = 0.6) 
+rect.hclust(pfit.w.r, k=3)
+
+plot(pfit.s.r, main="Cluster Dendrogram for Single Linkage", cex = 0.6) 
+rect.hclust(pfit.s.r, k=3)
+```
+
+These random samples of data for the dendrogram plot provide limited insights and are challenging to interpret.
+```{r}
+d <- dist(df.clust, method = "euclidean")
+pfit.c <- hclust(d, method = "complete")
+pfit.w <- hclust(d, method = "ward.D2")
+pfit.s <- hclust(d, method = "single")
+```
+
+```{r, warning = F}
+k <- 1:5
+groups.c <- cutree(pfit.c, k = k)
+groups.w <- cutree(pfit.w, k = k)
+groups.s <- cutree(pfit.s, k = k)
+
+groups.c.fp = as.data.frame(groups.c) %>%
+  pivot_longer(cols = k, names_to = "cluster", values_to = "level")
+conf.c = xtabs(~level + cluster, groups.c.fp)
+
+groups.w.fp = as.data.frame(groups.w) %>%
+    pivot_longer(cols = k, names_to = "cluster", values_to = "level")
+conf.w = xtabs(~level + cluster, groups.w.fp)
+
+groups.s.fp = as.data.frame(groups.s) %>%
+    pivot_longer(cols = k, names_to = "cluster", values_to = "level")
+conf.s = xtabs(~level + cluster, groups.s.fp)
+
+cat("Complete Linkage: \n")
+conf.c
+cat("Ward.D2 Linkage: \n")
+conf.w
+cat("Single Linkage: \n")
+conf.s
+```
+Since the dendrogram is challenging to interpret, we have decided to create a table showing the number of observations in each cluster. All three linkage methods exhibit distinct characteristics. Single linkage tends to keep observations isolated within each cluster, while ward.D2 aims to minimize the variance within the clusters.
+
+```{r, results = F}
+k <- 5
+groups.c <- cutree(pfit.c, k = k)
+groups.w <- cutree(pfit.w, k = k)
+groups.s <- cutree(pfit.s, k = k)
+print_clusters <- function(df, groups, cols_to_print) { 
+  Ngroups <- max(groups)
+  for (i in 1:Ngroups) {
+    print(paste("cluster", i))
+    print(df[groups == i, cols_to_print]) 
+  }
+}
+cols_to_print <- c("Youtuber", "subscribers", "highest_yearly_earnings", "Country") 
+print_clusters(df_gdp, groups.c, cols_to_print)
+```
+For Hierarchical Clustering using complete linkage, we can observe that at level 1 of hclust with 3, 4, and 5 clusters, it remains the same with 3 observations. We can utilize the `print_clusters()` function to access and identify these observations. In this case, the observations are T-Series, Cocomelon - Nursery Rhymes, and SET India. We might assume that this group is based on a high number of subscribers, highest yearly earnings, and being from India. However, this interpretation is for exploratory purposes, and the clustering interpretation is highly subjective.
+
+#### Visulize Cluster by PCA
+```{r}
+princ <- prcomp(df.clust)
+nComp <- 2
+project2D <- as.data.frame(predict(princ, newdata=df.clust)[, 1:nComp])
+
+hclust.c.project2D <- cbind(project2D, cluster=as.factor(groups.c), Youtuber=df_gdp$Youtuber)
+hclust.w.project2D <- cbind(project2D, cluster=as.factor(groups.w), Youtuber=df_gdp$Youtuber)
+hclust.s.project2D <- cbind(project2D, cluster=as.factor(groups.s), Youtuber=df_gdp$Youtuber)
+```
+
+```{r}
+# Finding convex hull
+library(grDevices)
+find_convex_hull <- function(proj2Ddf, groups) {
+  do.call(rbind, 
+          lapply(unique(groups),
+                 FUN = function(c) {
+                   f <- subset(proj2Ddf, cluster==c); 
+                   f[chull(f),]
+                 }
+                ) 
+          )
+}
+hclust.c.hull <- find_convex_hull(hclust.c.project2D, groups.c)
+hclust.w.hull <- find_convex_hull(hclust.w.project2D, groups.w)
+hclust.s.hull <- find_convex_hull(hclust.s.project2D, groups.s)
+```
+
+```{r}
+ggplot(hclust.c.project2D, aes(x=PC1, y=PC2)) +
+  geom_point(aes(shape=cluster, color=cluster)) + 
+  geom_text(aes(label=Youtuber, color=cluster), hjust=0, vjust=1, size=3) + 
+  geom_polygon(data=hclust.c.hull, aes(group=cluster, fill=as.factor(cluster)), alpha=0.4, linetype=0) +
+  ggtitle("Complete Linkage")
+
+ggplot(hclust.w.project2D, aes(x=PC1, y=PC2)) +
+  geom_point(aes(shape=cluster, color=cluster)) + 
+  geom_text(aes(label=Youtuber, color=cluster), hjust=0, vjust=1, size=3) + 
+  geom_polygon(data=hclust.w.hull, aes(group=cluster, fill=as.factor(cluster)), alpha=0.4, linetype=0) +
+  ggtitle("Ward’s Linkage")
+
+ggplot(hclust.s.project2D, aes(x=PC1, y=PC2)) +
+  geom_point(aes(shape=cluster, color=cluster)) + 
+  geom_text(aes(label=Youtuber, color=cluster), hjust=0, vjust=1, size=3) + 
+  geom_polygon(data=hclust.s.hull, aes(group=cluster, fill=as.factor(cluster)), alpha=0.4, linetype=0) +
+  ggtitle("Single Linkage")
+```
+
+When comparing complete and Ward linkage methods, it is observed that Ward linkage tends to form larger clusters, whereas complete linkage creates a combination of very small and very large clusters.
+
+#### Evaluate Clustering Performance
+```{r}
+library(fpc)
+kbest.p <- 12
+cboot.hclust.c <- clusterboot(df.clust, clustermethod = hclustCBI, method = "complete", k = kbest.p)
+groups.cboot.c <- cboot.hclust.c$result$partition
+```
+
+```{r}
+cboot.hclust.w <- clusterboot(df.clust, clustermethod = hclustCBI, method = "ward.D2", k = kbest.p)
+groups.cboot.w <- cboot.hclust.w$result$partition
+```
+
+```{r}
+cat("Complete Linkage: \n")
+(values <- 1 - cboot.hclust.c$bootbrd/100)
+cat("So clusters", order(values)[12], "and", order(values)[11], "are highly stable \n")
+
+cat("Ward's Linkage: \n")
+(values <- 1 - cboot.hclust.w$bootbrd/100)
+cat("So clusters", order(values)[12], "and", order(values)[11], "are highly stable \n")
+```
+
+```{r}
+# Function to return the squared Euclidean distance of two given points x and y
+sqr_euDist <- function(x, y) {
+    sum((x - y)^2)
+}
+
+# Function to calculate WSS of a cluster
+wss <- function(clustermat) {
+    c0 <- colMeans(clustermat)
+    sum(apply( clustermat, 1, FUN=function(row) {sqr_euDist(row, c0)} ))
+}
+
+# Function to calculate the total WSS
+wss_total <- function(scaled_df, labels) {
+    wss.sum <- 0
+    k <- length(unique(labels))
+    for (i in 1:k) 
+        wss.sum <- wss.sum + wss(subset(scaled_df, labels == i))
+    wss.sum
+}
+
+# Function to calculate total sum of squared (TSS)
+tss <- function(scaled_df) {
+   wss(scaled_df)
+}
+```
+
+```{r}
+# Function to return the CH indices computed using complete linkage
+CH_index.c <- function(scaled_df, kmax, method="kmeans") {
+    if (!(method %in% c("kmeans", "hclust"))) 
+        stop("method must be one of c('kmeans', 'hclust')")
+
+    npts <- nrow(scaled_df)
+    wss.value <- numeric(kmax) # create a vector of numeric type
+    # wss.value[1] stores the WSS value for k=1 (when all the
+    # data points form 1 large cluster).
+    wss.value[1] <- wss(scaled_df)
+
+    if (method == "kmeans") {
+        # kmeans
+        for (k in 2:kmax) {
+            clustering <- kmeans(scaled_df, k, nstart=10, iter.max=100)
+            wss.value[k] <- clustering$tot.withinss
+        } 
+    } else {
+        # hclust
+        d <- dist(scaled_df, method="euclidean")
+        pfit <- hclust(d, method="complete")
+        for (k in 2:kmax) {
+            labels <- cutree(pfit, k=k)
+            wss.value[k] <- wss_total(scaled_df, labels)
+        }
+    }
+    bss.value <- tss(scaled_df) - wss.value   # this is a vector
+    B <- bss.value / (0:(kmax-1))             # also a vector
+    W <- wss.value / (npts - 1:kmax)          # also a vector
+
+    data.frame(k = 1:kmax, CH_index = B/W, WSS = wss.value)
+}
+```
+
+```{r}
+# Function to return the CH indices computed using ward.D2 linkage
+CH_index.w <- function(scaled_df, kmax, method="kmeans") {
+    if (!(method %in% c("kmeans", "hclust"))) 
+        stop("method must be one of c('kmeans', 'hclust')")
+
+    npts <- nrow(scaled_df)
+    wss.value <- numeric(kmax) # create a vector of numeric type
+    # wss.value[1] stores the WSS value for k=1 (when all the
+    # data points form 1 large cluster).
+    wss.value[1] <- wss(scaled_df)
+
+    if (method == "kmeans") {
+        # kmeans
+        for (k in 2:kmax) {
+            clustering <- kmeans(scaled_df, k, nstart=10, iter.max=100)
+            wss.value[k] <- clustering$tot.withinss
+        } 
+    } else {
+        # hclust
+        d <- dist(scaled_df, method="euclidean")
+        pfit <- hclust(d, method="ward.D2")
+        for (k in 2:kmax) {
+            labels <- cutree(pfit, k=k)
+            wss.value[k] <- wss_total(scaled_df, labels)
+        }
+    }
+    bss.value <- tss(scaled_df) - wss.value   # this is a vector
+    B <- bss.value / (0:(kmax-1))             # also a vector
+    W <- wss.value / (npts - 1:kmax)          # also a vector
+
+    data.frame(k = 1:kmax, CH_index = B/W, WSS = wss.value)
+}
+```
+
+```{r}
+# complete linkage
+crit.df <- CH_index.c(df.clust, 12, method = "kmeans")
+fig1 <- ggplot(crit.df, aes(x=k, y=CH_index)) +
+  geom_point() + geom_line(colour="red") + 
+  scale_x_continuous(breaks=1:12, labels=1:12) +
+  labs(y="CH index")
+fig2 <- ggplot(crit.df, aes(x=k, y=WSS), color="blue") +
+  geom_point() + geom_line(colour="blue") + 
+  scale_x_continuous(breaks=1:12, labels=1:12)
+grid.arrange(fig1, fig2, nrow=1)
+
+# ward.D2 linkage
+crit.df <- CH_index.w(df.clust, 12, method = "hclust")
+fig1 <- ggplot(crit.df, aes(x=k, y=CH_index)) +
+  geom_point() + geom_line(colour="red") + 
+  scale_x_continuous(breaks=1:12, labels=1:12) +
+  labs(y="CH index")
+fig2 <- ggplot(crit.df, aes(x=k, y=WSS), color="blue") +
+  geom_point() + geom_line(colour="blue") + 
+  scale_x_continuous(breaks=1:12, labels=1:12)
+grid.arrange(fig1, fig2, nrow=1)
+```
+
+When using hierarchical clustering with the Euclidean distance metric and the complete linkage method, we find that the CH index is maximized at k = 2, while the ward.D2 linkage method results in k = 10. The WSS plot does not exhibit a clear elbow point.
+
+### Section 3 - K-means Clustering
+```{r}
+kmClustering.ch <- kmeansruns(df.clust, krange = 1:12, criterion = "ch")
+kmClustering.ch$bestk
+kmClustering.asw <- kmeansruns(df.clust, krange = 1:12, criterion = "asw")
+kmClustering.asw$bestk
+```
+
+```{r}
+kmCritframe <- data.frame(k=1:12, ch=kmClustering.ch$crit, asw=kmClustering.asw$crit)
+fig1 <- ggplot(kmCritframe, aes(x=k, y=ch)) +
+  geom_point() + geom_line(colour="red") + 
+  scale_x_continuous(breaks=1:12, labels=1:12) +
+  labs(y="CH index")
+fig2 <- ggplot(kmCritframe, aes(x=k, y=asw)) +  
+  geom_point() + geom_line(colour="blue") +
+  scale_x_continuous(breaks=1:12, labels=1:12) +
+  labs(y="ASW")
+grid.arrange(fig1, fig2, nrow=1)
+```
+
+Using k-means clustering, CH index and AWS is maximized at k = 2 clusters.
+```{r}
+fig <- c()
+kvalues <- seq(2, 5)
+for (k in kvalues) {
+  set.seed(3064)
+  groups <- kmeans(df.clust, k, nstart = 100, iter.max = 100)$cluster
+  kmclust.project2D <- cbind(project2D, cluster = as.factor(groups), Youtuber = df_gdp$Youtuber)
+  kmclust.hull <- find_convex_hull(kmclust.project2D, groups)
+  assign(paste0("fig", k),
+    ggplot(kmclust.project2D, aes(x = PC1, y = PC2)) +
+    geom_point(aes(shape = cluster, color = cluster)) +
+    geom_polygon(data = kmclust.hull, aes(group = cluster, fill = cluster),
+                 alpha = 0.4, linetype = 0) + 
+    labs(title = sprintf("k = %d", k)) +
+    theme(legend.position ="none")
+    )
+}
+grid.arrange(fig2, fig3, fig4, fig5,nrow = 2)
+```
+
+From these PCA plots, it's evident that k-means clustering consistently forms a single cluster on the left-hand side. As we increase the value of k, it breaks down the cluster on the right-hand side into subclusters.
+```{r}
+k_values <- 2:5
+table <- matrix(0, nrow = length(k_values), ncol = max(k_values))
+rownames(table) <- 2:5
+colnames(table) <- 1:5
+
+for (k_index in 1:length(k_values)) {
+  set.seed(3064)
+  k <- k_values[k_index]
+  kmeans_result <- kmeans(df.clust, centers = k, nstart = 100, iter.max = 100)
+  cluster_sizes <- table(kmeans_result$cluster)
+  
+  for (level in 1:k) {
+    table[k_index, level] <- cluster_sizes[level] 
+  }
+}
+cat("The number of observations in each cluster using k-means clustering \n")
+t(table)
+```
+
+#### Insight from clustering
+We calculate the mean of each feature within each cluster to gain insights into the relationships between them.
+```{r}
+set.seed(3064)
+km <- kmeans(df.clust, 5, nstart = 100, iter.max = 100)
+df_with_clusters <- df.clust %>% mutate(Cluster = km$cluster)
+cluster_means <- df_with_clusters %>% group_by(Cluster) %>% summarise_all(mean)
+```
+
+```{r}
+ggplot(cluster_means) +
+  geom_line(aes(x = Cluster, y = subscribers, linetype = "Subscribers", color = "Subscribers")) +
+  geom_line(aes(x = Cluster, y = video.views, linetype = "Video Views", color = "Video Views")) +
+  geom_line(aes(x = Cluster, y = uploads, linetype = "Uploads", color = "Uploads")) +
+  geom_line(aes(x = Cluster, y = video_views_for_the_last_30_days, linetype = "Video Views Last 30 Days", color = "Video Views Last 30 Days")) +
+  geom_line(aes(x = Cluster, y = highest_yearly_earnings, linetype = "Highest Yearly Earnings", color = "Highest Yearly Earnings")) +
+  geom_line(aes(x = Cluster, y = subscribers_for_last_30_days, linetype = "Subscribers Last 30 Days", color = "Subscribers Last 30 Days")) +
+  scale_x_continuous(breaks = 1:9, labels = 1:9) +
+  labs(title = "Mean of each feature by cluster", x = "cluster", y = "mean") +
+  scale_color_manual(values = c("Subscribers" = "blue", "Video Views" = "green", "Uploads" = "red", "Video Views Last 30 Days" = "purple", "Highest Yearly Earnings" = "orange", "Subscribers Last 30 Days" = "black")) +
+  scale_linetype_manual(values = c("Subscribers" = "solid", "Video Views" = "dashed", "Uploads" = "dotted", "Video Views Last 30 Days" = "longdash", "Highest Yearly Earnings" = "twodash", "Subscribers Last 30 Days" = "solid"))
+```
+
+Cluster 2 exhibits higher mean values for each feature compared to the other clusters. In contrast, the means in cluster 3 are generally close to 0, while cluster 5 shows negative means. Given that the features are scaled using z-normalization, we can conclude that cluster 2 represents YouTubers who are highly famous, with above-average income, subscribers, and video views. Cluster 3 represents average YouTubers, while cluster 5 represents less popular or non-famous ones.
+
+### Conclusion
+Clustering is an unsupervised learning technique used to group similar data points together based on their inherent similarities. Its purpose is to unveil natural patterns or groupings within the data without relying on a predefined target variable.
+
+Hierarchical clustering proves to be particularly useful when the optimal number of clusters is unknown, allowing for an exploration of clustering behavior based on different distance metrics and linkage methods. The choice of distance and linkage depends on the characteristics of the data and the objectives of the analysis. In contrast, K-means clustering requires the user to specify the desired number of clusters beforehand.
+
+Our clustering results exhibit a significant difference between the optimal choice of k = 10 from hierarchical clustering and k = 2 K-means clustering. It represents a trade-off between complexity and interpretability. Higher values of k can lead to more complex clusters, but the interpretation and insights may become challenging to discern. Conversely, a smaller k, such as k = 2, is easier to interpret but may oversimplify the underlying patterns, potentially leading to a loss of valuable information.
+
+## Refferences
+- Datacamp. Feature Selection in R with the Boruta R Package. https://www.datacamp.com/tutorial/feature-selection-R-boruta.
+- Debarati Dutta. (2016, March 22). Boruta Package in R. https://www.analyticsvidhya.com/blog/2016/03/select-importantvariables-boruta-package/.
+- OpenAI. (2023). ChatGPT [Large language model]. https://chat.openai.com/chat.
+- GDP per capita (current US$). https://data.worldbank.org/indicator/NY.GDP.PCAP.CD.
+- GDP per capita, current prices. https://www.imf.org/external/datamapper/NGDPDPC@WEO/OEMDC/ADVEC/WEOWORLD.
+
+## Digital signature
+![](/Users/angelajacinto/Library/CloudStorage/OneDrive-UWA/CITS4009/project2/Project2 copy/TK-signature.jpeg)
+![](/Users/angelajacinto/Library/CloudStorage/OneDrive-UWA/CITS4009/project2/Project2 copy/Angela-signature.png)
+
